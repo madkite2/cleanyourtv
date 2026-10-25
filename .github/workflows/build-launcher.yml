@@ -24,6 +24,21 @@ jobs:
       - name: Show launcher folder
         run: ls -la launcher launcher/app || true
 
+      - name: Apply Glass theme settings
+        run: |
+          F=launcher/app/src/main/res/values/config.xml
+          setb() { sed -i -E "s|(<bool name=\"$1\">)[^<]*(</bool>)|\1$2\2|" "$F"; }
+          setb cinematic_home true
+          setb dock_glass true
+          setb icon_only_buttons true
+          setb show_inputs_pill false
+          setb app_glow true
+          setb focus_overshoot false
+          setb advanced_effects true
+          setb show_stats true
+          sed -i -E 's|(<string name="glow_style" translatable="false">)[^<]*|\1horizon|' "$F"
+          grep -E 'name="(cinematic_home|dock_glass|icon_only_buttons|show_inputs_pill|app_glow|focus_overshoot|advanced_effects|show_stats|glow_style)"' "$F"
+
       - name: Build
         working-directory: launcher
         run: |

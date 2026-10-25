@@ -42,6 +42,18 @@ jobs:
           [ -n "$GRADLE" ] || { echo "No gradle project found"; ls -R "$DIR"; exit 1; }
           echo "proj=$(dirname "$GRADLE")" >> "$GITHUB_OUTPUT"
 
+      - name: Use permanent signing key
+        env:
+          KS: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          mkdir -p ~/.android
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > ~/.android/debug.keystore
+            keytool -list -keystore ~/.android/debug.keystore -storepass android | tail -2
+          else
+            echo "::warning::KEYSTORE_B64 secret is empty, APK gets a random key"
+          fi
+
       - name: Build
         working-directory: ${{ steps.find.outputs.proj }}
         run: |

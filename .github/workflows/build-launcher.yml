@@ -39,6 +39,18 @@ jobs:
           sed -i -E 's|(<string name="glow_style" translatable="false">)[^<]*|\1horizon|' "$F"
           grep -E 'name="(cinematic_home|dock_glass|icon_only_buttons|show_inputs_pill|app_glow|focus_overshoot|advanced_effects|show_stats|glow_style)"' "$F"
 
+      - name: Use permanent signing key
+        env:
+          KS: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          mkdir -p ~/.android
+          if [ -n "$KS" ]; then
+            echo "$KS" | base64 -d > ~/.android/debug.keystore
+            keytool -list -keystore ~/.android/debug.keystore -storepass android | tail -2
+          else
+            echo "::warning::KEYSTORE_B64 secret is empty, APK gets a random key"
+          fi
+
       - name: Build
         working-directory: launcher
         run: |

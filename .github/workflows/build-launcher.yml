@@ -39,6 +39,238 @@ jobs:
           sed -i -E 's|(<string name="glow_style" translatable="false">)[^<]*|\1horizon|' "$F"
           grep -E 'name="(cinematic_home|dock_glass|icon_only_buttons|show_inputs_pill|app_glow|focus_overshoot|advanced_effects|show_stats|glow_style)"' "$F"
 
+      - name: Add weather and stats switches to the launcher
+        run: |
+          cat > launcher/app/src/main/java/com/gathin/tvhome/Weather.java <<'WEATHER_EOF'
+          package com.gathin.tvhome;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.Locale;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          /** Current temperature and conditions from Open-Meteo (no key). Never blocks the caller. */
+          final class Weather {
+              private static final long OK_MS = 30 * 60_000L;
+              private static final long RETRY_MS = 5 * 60_000L;
+              private static final Pattern COORD = Pattern.compile("-?[0-9]{1,3}(?:\\.[0-9]{1,6})?");
+              private static final Pattern CURRENT = Pattern.compile("\"current\"\\s*:\\s*\\{([^}]*)\\}");
+              private static final Pattern TEMP = Pattern.compile("\"temperature_2m\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
+              private static final Pattern CODE = Pattern.compile("\"weather_code\"\\s*:\\s*([0-9]+)");
+
+              private static volatile String text = "";
+              private static volatile long nextTry = 0;
+              private static volatile boolean busy;
+
+              /** The last known text ("+12°, clear"), or "" before the first answer. Starts a fetch in the background when due. */
+              static String get(String lat, String lon, Locale locale) {
+                  if (lat == null || lon == null) return text;
+                  final String la = lat.trim();
+                  final String lo = lon.trim();
+                  if (!COORD.matcher(la).matches() || !COORD.matcher(lo).matches()) return text;
+                  long now = System.currentTimeMillis();
+                  if (!busy && now >= nextTry) {
+                      busy = true;
+                      nextTry = now + RETRY_MS;
+                      final boolean ru = "ru".equals(locale.getLanguage());
+                      Thread t = new Thread(() -> {
+                          try {
+                              String s = fetch(la, lo, ru);
+                              if (s != null) {
+                                  text = s;
+                                  nextTry = System.currentTimeMillis() + OK_MS;
+                              }
+                          } catch (Throwable ignored) {
+                              // offline or a bad answer: keep the old text, try again in 5 minutes
+                          } finally {
+                              busy = false;
+                          }
+                      }, "weather");
+                      t.setDaemon(true);
+                      t.start();
+                  }
+                  return text;
+              }
+
+              private static String fetch(String lat, String lon, boolean ru) throws Exception {
+                  URL url = new URL("https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon
+                          + "&current=temperature_2m,weather_code&timezone=auto");
+                  HttpURLConnection c = (HttpURLConnection) url.openConnection();
+                  c.setConnectTimeout(8000);
+                  c.setReadTimeout(8000);
+                  try {
+                      if (c.getResponseCode() != 200) return null;
+                      InputStream in = c.getInputStream();
+                      ByteArrayOutputStream out = new ByteArrayOutputStream();
+                      byte[] buf = new byte[1024];
+                      int n;
+                      while ((n = in.read(buf)) > 0 && out.size() < 8192) out.write(buf, 0, n);
+                      return format(out.toString("UTF-8"), ru);
+                  } finally {
+                      c.disconnect();
+                  }
+              }
+
+              static String format(String json, boolean ru) {
+                  Matcher cur = CURRENT.matcher(json);
+                  if (!cur.find()) return null;
+                  String body = cur.group(1);
+                  Matcher t = TEMP.matcher(body);
+                  if (!t.find()) return null;
+                  long deg = Math.round(Double.parseDouble(t.group(1)));
+                  String temp = (deg > 0 ? "+" : "") + deg + "\u00B0";
+                  Matcher k = CODE.matcher(body);
+                  String word = k.find() ? word(Integer.parseInt(k.group(1)), ru) : "";
+                  return word.isEmpty() ? temp : temp + ", " + word;
+              }
+
+              private static String word(int code, boolean ru) {
+                  if (code == 0) return ru ? "ясно" : "clear";
+                  if (code <= 2) return ru ? "переменная облачность" : "partly cloudy";
+                  if (code == 3) return ru ? "пасмурно" : "overcast";
+                  if (code == 45 || code == 48) return ru ? "туман" : "fog";
+                  if (code >= 51 && code <= 57) return ru ? "морось" : "drizzle";
+                  if (code >= 61 && code <= 67) return ru ? "дождь" : "rain";
+                  if (code >= 71 && code <= 77) return ru ? "снег" : "snow";
+                  if (code >= 80 && code <= 82) return ru ? "ливень" : "showers";
+                  if (code == 85 || code == 86) return ru ? "снегопад" : "snow showers";
+                  if (code >= 95) return ru ? "гроза" : "thunderstorm";
+                  return "";
+              }
+          }
+          WEATHER_EOF
+          cat > /tmp/patch.py <<'PATCH_EOF'
+          import re, sys, pathlib
+
+          ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "launcher")
+          LAT, LON = "45.62", "63.31"   # Baikonur
+          JAVA = ROOT / "app/src/main/java/com/gathin/tvhome"
+          RES = ROOT / "app/src/main/res/values/config.xml"
+          MANIFEST = ROOT / "app/src/main/AndroidManifest.xml"
+
+
+          def edit(path, pairs):
+              s = path.read_text(encoding="utf-8")
+              for old, new in pairs:
+                  n = s.count(old)
+                  if n != 1:
+                      sys.exit("PATCH FAILED in %s: anchor found %d times:\n%s" % (path.name, n, old))
+                  s = s.replace(old, new)
+              path.write_text(s, encoding="utf-8")
+              print("patched", path.name)
+
+
+          # 1. internet permission
+          edit(MANIFEST, [(
+              '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n',
+              '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n'
+              '    <uses-permission android:name="android.permission.INTERNET" />\n')])
+
+          # 2. coordinates in config.xml
+          s = RES.read_text(encoding="utf-8")
+          for name, val in (("latitude", LAT), ("longitude", LON)):
+              pat = re.compile(r'(<string name="%s" translatable="false">)[^<]*(</string>)' % name)
+              if len(pat.findall(s)) != 1:
+                  sys.exit("PATCH FAILED: %s string not found in config.xml" % name)
+              s = pat.sub(lambda m: m.group(1) + val + m.group(2), s)
+          RES.write_text(s, encoding="utf-8")
+          print("patched config.xml coordinates")
+
+          # 3. main screen: weather in front of the stats line, both switchable
+          edit(JAVA / "MainActivity.java", [
+              ('    private boolean showStats;\n',
+               '    private boolean showStats;\n'
+               '    private boolean statsOn, weatherOn;\n'
+               '    private String weatherLat = "", weatherLon = "";\n'),
+              ('        showStats = cfg.showStats;\n',
+               '        SharedPreferences statsPrefs = getSharedPreferences(Config.SETTINGS_NAME, MODE_PRIVATE);\n'
+               '        statsOn = statsPrefs.getBoolean("show_stats", cfg.showStats);\n'
+               '        weatherLat = getString(R.string.latitude).trim();\n'
+               '        weatherLon = getString(R.string.longitude).trim();\n'
+               '        weatherOn = statsPrefs.getBoolean("show_weather", true)\n'
+               '                && !weatherLat.isEmpty() && !weatherLon.isEmpty();\n'
+               '        showStats = statsOn || weatherOn;\n'),
+              ('    private String readStatsLine() {\n        int cpu = cpuPercent();\n',
+               '    private String readStatsLine() {\n'
+               '        java.util.Locale statsLocale = getResources().getConfiguration().getLocales().get(0);\n'
+               '        StringBuilder head = new StringBuilder();\n'
+               '        if (weatherOn) {\n'
+               '            String w = Weather.get(weatherLat, weatherLon, statsLocale);\n'
+               '            if (!w.isEmpty()) head.append(w);\n'
+               '        }\n'
+               '        if (!statsOn) return StatsText.forLocale(head.toString(), statsLocale);\n'
+               '        int cpu = cpuPercent();\n'),
+              ('        return StatsText.forLocale(line.toString(), getResources().getConfiguration().getLocales().get(0));',
+               '        String full = head.length() > 0 ? head + "  \\u00B7  " + line : line.toString();\n'
+               '        return StatsText.forLocale(full, statsLocale);'),
+          ])
+
+          # 4. launcher settings: two extra rows, built from the look of an existing one
+          edit(JAVA / "LauncherSettingsActivity.java", [
+              ('import android.view.View;\n',
+               'import android.view.View;\nimport android.view.ViewGroup;\nimport android.util.TypedValue;\n'),
+              ('    private TextView advancedChoice;\n',
+               '    private TextView advancedChoice;\n'
+               '    private TextView statsChoice, weatherChoice;\n'
+               '    private boolean statsOn, weatherOn;\n'),
+              ('        openOnStartChoice = findViewById(R.id.openOnStartChoice);\n',
+               '        statsOn = choices.getBoolean("show_stats", config.showStats);\n'
+               '        weatherOn = choices.getBoolean("show_weather", true);\n'
+               '        statsChoice = extraRow(advancedChoice);\n'
+               '        weatherChoice = extraRow(statsChoice);\n'
+               '        statsChoice.setOnClickListener(v -> {\n'
+               '            statsOn = !statsOn;\n'
+               '            choices.edit().putBoolean("show_stats", statsOn).apply();\n'
+               '            changed();\n'
+               '            refresh();\n'
+               '        });\n'
+               '        weatherChoice.setOnClickListener(v -> {\n'
+               '            weatherOn = !weatherOn;\n'
+               '            choices.edit().putBoolean("show_weather", weatherOn).apply();\n'
+               '            changed();\n'
+               '            refresh();\n'
+               '        });\n'
+               '        openOnStartChoice = findViewById(R.id.openOnStartChoice);\n'),
+              ('        openOnStartChoice.setText(getString(R.string.open_on_start_state, openOnStartLabel()));\n',
+               '        openOnStartChoice.setText(getString(R.string.open_on_start_state, openOnStartLabel()));\n'
+               '        boolean ru = "ru".equals(getResources().getConfiguration().getLocales().get(0).getLanguage());\n'
+               '        statsChoice.setText((ru ? "Статистика под часами: " : "Stats under the clock: ")\n'
+               '                + getString(statsOn ? R.string.on : R.string.off));\n'
+               '        weatherChoice.setText((ru ? "Погода под часами: " : "Weather under the clock: ")\n'
+               '                + getString(weatherOn ? R.string.on : R.string.off));\n'),
+              ('    private void reverseRow(TextView[] views) {\n',
+               '    /** A new row right after {@code like}, copying its look so it matches the other settings rows. */\n'
+               '    private TextView extraRow(TextView like) {\n'
+               '        TextView row = new TextView(this);\n'
+               '        ViewGroup parent = (ViewGroup) like.getParent();\n'
+               '        ViewGroup.LayoutParams lp = like.getLayoutParams();\n'
+               '        if (parent instanceof LinearLayout && lp instanceof ViewGroup.MarginLayoutParams) {\n'
+               '            row.setLayoutParams(new LinearLayout.LayoutParams((ViewGroup.MarginLayoutParams) lp));\n'
+               '        } else {\n'
+               '            row.setLayoutParams(new ViewGroup.LayoutParams(lp));\n'
+               '        }\n'
+               '        if (like.getBackground() != null && like.getBackground().getConstantState() != null) {\n'
+               '            row.setBackground(like.getBackground().getConstantState().newDrawable().mutate());\n'
+               '        }\n'
+               '        row.setTextColor(like.getTextColors());\n'
+               '        row.setTextSize(TypedValue.COMPLEX_UNIT_PX, like.getTextSize());\n'
+               '        row.setTypeface(like.getTypeface());\n'
+               '        row.setGravity(like.getGravity());\n'
+               '        row.setMinHeight(like.getMinHeight());\n'
+               '        row.setPadding(like.getPaddingLeft(), like.getPaddingTop(), like.getPaddingRight(), like.getPaddingBottom());\n'
+               '        row.setFocusable(true);\n'
+               '        row.setClickable(true);\n'
+               '        parent.addView(row, parent.indexOfChild(like) + 1);\n'
+               '        return row;\n'
+               '    }\n\n'
+               '    private void reverseRow(TextView[] views) {\n'),
+          ])
+          PATCH_EOF
+          python3 /tmp/patch.py launcher
+
       - name: Use permanent signing key
         env:
           KS: ${{ secrets.KEYSTORE_B64 }}
